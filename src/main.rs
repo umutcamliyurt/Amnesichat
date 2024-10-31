@@ -1,10 +1,10 @@
 #[macro_use]
 extern crate rocket;
 
-use rocket::response::Redirect;
+use rocket::response::{Redirect, content::RawHtml};
 use rocket::serde::{Serialize, Deserialize};
 use rocket::State;
-use rocket::response::content::RawHtml;
+use rocket::http::Status;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -12,32 +12,29 @@ use tokio::time::{interval, Duration};
 use std::time::{SystemTime, UNIX_EPOCH};
 use html_escape::encode_text;
 use tokio::time::sleep;
+use zeroize::Zeroize;
+use rocket::serde::json::Json;
 
-// Import encryption dependencies
-use aes::Aes256;
-use block_modes::{BlockMode, Cbc};
-use block_modes::block_padding::Pkcs7;
-use rand::Rng;
-use argon2::{Argon2, password_hash::SaltString, PasswordHasher};
-
-// Type alias for AES-256-CBC
-type Aes256Cbc = Cbc<Aes256, Pkcs7>;
-
-// Constants for the encryption
-const ENCRYPTION_IV_SIZE: usize = 16;
+mod encryption;
+use crate::encryption::{encrypt_message, decrypt_message, is_message_encrypted};
 
 // Constants
 const TIME_WINDOW: u64 = 60;
-const REQUEST_LIMIT: u64 = 5;
-const MAX_MESSAGE_LENGTH: usize = 200;
-const RECENT_MESSAGE_LIMIT: usize = 1000; // Maximum number of messages
+const MESSAGE_LIMIT: usize = 20; // 20 messages in 60 seconds
+const MAX_MESSAGE_LENGTH: usize = 10 * 1024 * 1024; // 10 megabytes
+const RECENT_MESSAGE_LIMIT: usize = 100; // Maximum number of messages
 const MESSAGE_EXPIRY_DURATION: u64 = 86400; // 1 day
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message {
-    username: String,
     content: String,
     timestamp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageData {
+    message: String,
+    password: String,
 }
 
 #[derive(Debug)]
@@ -45,6 +42,7 @@ struct ChatState {
     messages: Arc<Mutex<Vec<Message>>>,
     user_request_timestamps: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     recent_messages: Arc<Mutex<HashSet<String>>>,
+    global_message_timestamps: Arc<Mutex<Vec<u64>>>,
 }
 
 // Manually implement Clone for ChatState with Arc
@@ -54,62 +52,10 @@ impl Clone for ChatState {
             messages: Arc::clone(&self.messages),
             user_request_timestamps: Arc::clone(&self.user_request_timestamps),
             recent_messages: Arc::clone(&self.recent_messages),
+            global_message_timestamps: Arc::clone(&self.global_message_timestamps),
         }
     }
 }
-
-// Encryption key derivation function with salt
-fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
-    let argon2 = Argon2::default();
-    let salt = SaltString::b64_encode(salt).expect("Failed to generate salt string");  // Convert salt to SaltString format
-    let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .expect("Failed to hash password");
-
-    let hash_bytes = hash.hash.expect("Hash missing in PasswordHash structure");  // Access the hash directly
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(hash_bytes.as_bytes());
-    key
-}
-
-
-// Encryption function
-fn encrypt_message(plain_text: &str, password: &str) -> Result<String, &'static str> {
-    let mut rng = rand::thread_rng();
-    let iv: [u8; ENCRYPTION_IV_SIZE] = rng.gen();
-    let salt: [u8; 16] = rng.gen();
-
-    let key = derive_key(password, &salt); // Pass salt as an argument
-    let cipher = Aes256Cbc::new_from_slices(&key, &iv).map_err(|_| "Encryption error")?;
-    let encrypted_data = cipher.encrypt_vec(plain_text.as_bytes());
-
-    Ok(format!("{}:{}:{}", hex::encode(salt), hex::encode(iv), hex::encode(encrypted_data)))
-}
-
-
-
-// Decryption function
-fn decrypt_message(encrypted_text: &str, password: &str) -> Result<String, &'static str> {
-    let parts: Vec<&str> = encrypted_text.split(':').collect();
-    if parts.len() != 3 {
-        return Err("Invalid encrypted message format");
-    }
-
-    let salt = hex::decode(parts[0]).map_err(|_| "Decryption error")?;
-    let iv = hex::decode(parts[1]).map_err(|_| "Decryption error")?;
-    let encrypted_data = hex::decode(parts[2]).map_err(|_| "Decryption error")?;
-
-    // Derive key using PBKDF2 with the extracted salt
-    let key = derive_key(password, &salt);
-
-    let cipher = Aes256Cbc::new_from_slices(&key, &iv).map_err(|_| "Decryption error")?;
-    let decrypted_data = cipher.decrypt_vec(&encrypted_data).map_err(|_| "Decryption error")?;
-
-    String::from_utf8(decrypted_data).map_err(|_| "Decryption error")
-}
-
-
 
 // Helper function to format the timestamp into HH:MM:SS
 fn format_timestamp(timestamp: u64) -> String {
@@ -119,26 +65,22 @@ fn format_timestamp(timestamp: u64) -> String {
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
-// Function to check if a user is allowed to send a message
-async fn is_request_allowed(username: &str, state: &ChatState) -> bool {
-    let mut timestamps = state.user_request_timestamps.lock().await;
+// Function to check if the message count exceeds the limit globally
+async fn check_message_limit(state: &ChatState) -> bool {
+    let mut global_timestamps = state.global_message_timestamps.lock().await;
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    if let Some((last_request_time, request_count)) = timestamps.get_mut(username) {
-        if current_time - *last_request_time > TIME_WINDOW {
-            *last_request_time = current_time;
-            *request_count = 1;
-            true
-        } else if *request_count < REQUEST_LIMIT {
-            *request_count += 1;
-            true
-        } else {
-            false
-        }
-    } else {
-        timestamps.insert(username.to_string(), (current_time, 1));
-        true
+    // Remove messages older than the time window (60 seconds)
+    global_timestamps.retain(|&timestamp| current_time - timestamp <= TIME_WINDOW);
+
+    // Check if we have exceeded the message limit (20 messages in 60 seconds)
+    if global_timestamps.len() >= MESSAGE_LIMIT {
+        return false; // Exceeded the limit
     }
+
+    // Record the current message timestamp
+    global_timestamps.push(current_time);
+    true
 }
 
 // Function to check if the message is valid (length and total message count)
@@ -161,274 +103,138 @@ async fn is_message_valid(message: &str, state: &ChatState) -> bool {
     true
 }
 
-// Index route to render chat interface with decrypted messages
-#[get("/?<username>&<password>")]
-async fn index(username: Option<String>, password: Option<String>, state: &State<Arc<ChatState>>) -> RawHtml<String> {
-    let messages = state.messages.lock().await;
+#[get("/messages?<password>")]
+async fn messages(password: Option<String>, state: &State<Arc<ChatState>>) -> String {
+    let chat_state = state.inner();
+    let messages = chat_state.messages.lock().await;
 
-    let mut html = String::from(
-        r#"
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <meta http-equiv="refresh" content="60">
-            <title>Amnesichat</title>
-            <style>
-                * {
-                    box-sizing: border-box;
-                    margin: 0;
-                    padding: 0;
-                }
-                body {
-                    background-color: #000000;
-                    color: #e0e0e0;
-                    font-family: Arial, sans-serif;
-                    margin: 0;
-                    padding: 0;
-                    display: flex;
-                    flex-direction: column;
-                    min-height: 100vh;
-                }
-                h1 {
-                    font-size: 1.5em;
-                    text-align: center;
-                    color: #ffffff;
-                    margin-bottom: 10px;
-                }
-                #disclaimer {
-                    font-size: 0.9em;
-                    text-align: center;
-                    margin-bottom: 15px;
-                    font-style: italic;
-                }
-                #chat-container {
-                    flex: 1;
-                    background-color: #1e1e1e;
-                    padding: 10px;
-                    margin: 10px;
-                    border-radius: 8px;
-                    overflow-y: auto;
-                    display: flex;
-                    flex-direction: column;
-                    max-height: 70vh;
-                }
-                #messages {
-                    flex: 1;
-                    overflow-y: auto;
-                }
-                #messages p {
-                    background-color: #2e2e2e;
-                    border-left: 4px solid #00c853;
-                    padding: 10px;
-                    margin-bottom: 10px;
-                    border-radius: 6px;
-                    line-height: 1.5;
-                }
-                #chat-form {
-                    background-color: #1c1c1c;
-                    padding: 10px;
-                    border-radius: 8px;
-                    width: 100%;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    box-shadow: 0 -4px 10px rgba(0, 0, 0, 0.5);
-                }
-                input[type="text"], input[type="password"], input[type="submit"] {
-                    border-radius: 6px;
-                    padding: 10px;
-                    margin-top: 5px;
-                    width: 100%;
-                    max-width: 100%;
-                    background-color: #2e2e2e;
-                    color: #e0e0e0;
-                    border: 1px solid #444;
-                }
-                input[type="submit"] {
-                    background-color: #007bff;
-                    color: white;
-                    border: none;
-                    cursor: pointer;
-                    transition: background-color 0.3s ease;
-                }
-                input[type="submit"]:hover {
-                    background-color: #0056b3;
-                }
-                @media (max-width: 768px) {
-                    h1 {
-                        font-size: 1.2em;
-                    }
-                    #chat-container {
-                        max-height: 60vh;
-                        margin: 5px;
-                    }
-                    #chat-form {
-                        padding: 10px;
-                    }
-                    input[type="text"], input[type="submit"], input[type="password"] {
-                        font-size: 1em;
-                        padding: 8px;
-                    }
-                }
-                #footer {
-                    text-align: center;
-                    margin-top: 15px;
-                }
-                #footer a {
-                    color: #007bff;
-                    text-decoration: none;
-                }
-                #footer a:hover {
-                    text-decoration: underline;
-                }
-                details {
-                    background-color: #1c1c1c;
-                    border-radius: 8px;
-                    margin: 10px 0;
-                    padding: 10px;
-                }
-                summary {
-                    cursor: pointer;
-                    outline: none;
-                    font-weight: bold;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>Amnesichat</h1>
-            <div id="disclaimer">Warning: By using this service, you agree to the terms of service and acknowledge that you will not use it for illegal activities. The developer is not responsible for any misuse of the tool.</div>
-            <div id="chat-container">
-                <h2>Messages:</h2>
-                <div id="messages">
-        "#,
-    );
+    let mut html = String::new();
+    for message in messages.iter() {
+        // Format timestamp for display
+        let timestamp = format_timestamp(message.timestamp);
+
+        // Decrypt message content based on the provided password, if available
+        let decrypted_content = match &password {
+            Some(ref pw) => decrypt_message(&message.content, pw).unwrap_or_else(|_| {
+                // Return nothing when decryption fails
+                return String::new();  // Empty string will effectively remove the message from HTML
+            }),
+            None => String::new(),  // No password provided, return empty content
+        };
+
+        // If decryption fails (decrypted_content is empty), skip appending the message
+        if decrypted_content.is_empty() {
+            continue;  // Skip this message entirely
+        }
+
+        // Display the decrypted content, or nothing if decryption failed
+        html.push_str(&format!(
+            r#"<p>[{}]: {}</p>"#,
+            timestamp,
+            encode_text(&decrypted_content)
+        ));
+    }
+
+    html
+}
+
+#[get("/?<password>")]
+async fn index(password: Option<String>, state: &State<Arc<ChatState>>) -> Result<RawHtml<String>, Status> {
+    // Read the static HTML template
+    let mut html = tokio::fs::read_to_string("static/index.html")
+        .await
+        .map_err(|_error| Status::InternalServerError)?;
+
+    // Get password, defaulting to empty string if not provided
+    // Safely handle temporary value by assigning them to variable
+    let password_value = password.clone().unwrap_or_else(|| "".to_string());
+
+    // Safely encode them using encode_text.
+    let encoded_password = encode_text(&password_value);
+
+    // Replace placeholder with actual values
+    html = html.replace("PASSWORD_PLACEHOLDER", &encoded_password);
+
+    // Get current chat messages and generate HTML for them
+    let messages = state.messages.lock().await;
+    let mut messages_html = String::new();
 
     for msg in messages.iter() {
         let timestamp = format_timestamp(msg.timestamp);
-        
-        // Decrypt the message content using the provided password
-        let decrypted_content = match &password {
-            Some(ref pw) => decrypt_message(&msg.content, pw), // Directly using the password
-            None => Err("Password not provided"), // Handle missing password case
+
+        // Decrypt message content based on provided password
+        let decrypted_content = if let Some(ref pw) = password {
+            decrypt_message(&msg.content, pw).unwrap_or_else(|_| "Decryption failed".to_string())
+        } else {
+            "Password not provided".to_string()
         };
 
-        // Only push to HTML if decryption is successful
-        if let Ok(content) = decrypted_content {
-            html.push_str(&format!(
-                "<p><strong>{}</strong> [{}]: {}</p>",
-                encode_text(&msg.username), // Escape username
-                timestamp,
-                encode_text(&content) // Escape decrypted message content
-            ));
-        } // Ignore messages with decryption failure
+        // Add the message to the HTML string
+        messages_html.push_str(&format!(
+            "<p>[{}]: {}</p>",
+            timestamp,
+            encode_text(&decrypted_content)
+        ));
     }
 
-    html.push_str(
-        r#"
-                </div>
-            </div>
-            <div id="chat-form">
-                <form action="/send" method="get">
-                    <label for="username">Username:</label>
-                    <input type="text" id="username" name="username" required value="USERNAME_PLACEHOLDER"><br>
-                    <label for="message">Message:</label>
-                    <input type="text" id="message" name="message" required><br>
-                    <label for="password">Pre-Shared Password (Optional):</label>
-                    <input type="text" id="password" name="password" value="PASSWORD_PLACEHOLDER"><br> <!-- Allow empty value -->
-                    <input type="submit" value="Send">
-                </form>
-            </div>
-            <div id="footer">
-                <p>
-                    <a href="https://github.com/umutcamliyurt/Amnesichat" target="_blank">Source Code</a> |
-                    <a href="monero:8495bkvsReJAvxm8YP5KUQ9BWxh6Ta63eZGjF4HqU4JcUXdQtXBeBGyWte8L95sSJUMUvh5GHD1RcTNebfTNmFgmRX4XJja">Donate Monero</a>
-                </p>
-                <details>
-                    <summary>Privacy Policy</summary>
-                    <p>Your privacy is of utmost importance to us. This Privacy Policy outlines how we handle your information when you use our services.</p>
-                    <p>We do not collect, store, or share any personal information or chat logs from users. All messages are temporary and are deleted once the chat session ends.</p>
-                    <p>All communication on Amnesichat is encrypted using industry-standard encryption protocols to ensure your conversations remain private and secure.</p>
-                    <p>Our service does not use cookies or any tracking technologies to collect data about your usage. We do not monitor your activities on our platform.</p>
-                    <p>We may update this Privacy Policy from time to time to reflect changes in our practices. We encourage you to periodically review this page for the latest information on our privacy practices.</p>
-                    <p>If you have any questions about this Privacy Policy or our data practices, please contact us at nemesisuks@protonmail.com.</p>
-                </details>
+    // Insert messages into the HTML template
+    html = html.replace("<!-- Messages will be dynamically inserted here -->", &messages_html);
 
-                <details>
-                    <summary>Terms of Service</summary>
-                    <p>By accessing or using Amnesichat, you agree to be bound by the following terms and conditions:</p>
-                    <p>These Terms of Service govern your use of the Amnesichat service. If you do not agree to these terms, you should not use the service.</p>
-                    <p>You agree to use Amnesichat solely for lawful purposes. Prohibited activities include, but are not limited to:</p>
-                    <ul>
-                        <li>Engaging in any form of harassment, abuse, or harmful behavior towards others.</li>
-                        <li>Sharing illegal content or engaging in illegal activities.</li>
-                        <li>Attempting to access, interfere with, or disrupt the service or servers.</li>
-                        <li>Impersonating any person or entity or misrepresenting your affiliation with a person or entity.</li>
-                    </ul>
-                    <p>Amnesichat is not responsible for any loss, damage, or harm resulting from your use of the service or any third-party interactions. Use of the service is at your own risk.</p>
-                    <p>We reserve the right to modify or discontinue the service at any time without notice. We will not be liable for any modification, suspension, or discontinuance of the service.</p>
-                    <p>These Terms of Service shall be governed by and construed in accordance with the laws of Türkiye.</p>
-                    <p>We may update these Terms of Service from time to time. We will notify users of any significant changes by posting a notice on our website. Continued use of the service after changes signifies your acceptance of the new terms.</p>
-                    <p>If you have any questions regarding these Terms of Service, please contact us at nemesisuks@protonmail.com.</p>
-                </details>
-
-            </div>
-        </body>
-        </html>
-        "#
-    );
-
-    let username_value = username.unwrap_or_else(|| "".to_string());
-    let password_value = password.unwrap_or_else(|| "".to_string());
-    let final_html = html
-        .replace("USERNAME_PLACEHOLDER", &username_value)
-        .replace("PASSWORD_PLACEHOLDER", &password_value);
-    RawHtml(final_html)
+    // Return the final HTML to the client
+    Ok(RawHtml(html))
 }
 
 // Route for sending a message with encryption
-#[get("/send?<username>&<message>&<password>")]
-async fn send(username: String, message: String, password: String, state: &State<Arc<ChatState>>) -> Result<Redirect, RawHtml<String>> {
-    let username = username.trim();
-    let message = message.trim();
-    let password = password.trim();
+#[post("/send", data = "<message_data>")]
+async fn send(message_data: Json<MessageData>, state: &State<Arc<ChatState>>) -> Result<Redirect, RawHtml<String>> {
+    let message = message_data.message.trim();
+    let password = message_data.password.trim();
 
-    // Delay message processing by 10 seconds
-    sleep(Duration::from_secs(10)).await;
+    // Delay message processing by 2 seconds
+    sleep(Duration::from_secs(2)).await;
 
-    // Validate the request frequency limit
-    if !is_request_allowed(username, state).await {
-        return Err(RawHtml("You are sending messages too quickly. Please wait a moment.".to_string()));
+    // Check if the message limit has been exceeded globally
+    if !check_message_limit(&state.inner()).await {
+        return Err(RawHtml("Too many messages sent in a short period. Please wait for 2 minutes.".to_string()));
+    }
+
+    // Reject the request if the room password field is empty
+    if password.is_empty() {
+        return Err(RawHtml("Room password cannot be empty. Please provide a password.".to_string()));
+    }
+
+    // Check if the password is at least 8 characters long
+    if password.len() < 8 {
+        return Err(RawHtml("Room password must be at least 8 characters long.".to_string()));
     }
 
     // Check if the message is valid (length and total message count)
     if !is_message_valid(message, state).await {
-        return Err(RawHtml("Invalid message. Make sure it's less than 200 characters.".to_string()));
+        return Err(RawHtml("Invalid message. Make sure it's less than 10MB.".to_string()));
     }
 
-    // Lock the messages state
+    // Check if the message is encrypted
+    if !is_message_encrypted(message) {
+        return Err(RawHtml("Message is not encrypted. Please provide an encrypted message.".to_string()));
+    }
+
     let mut messages = state.messages.lock().await;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    // Encrypt the message using the provided password
     let encrypted_content = encrypt_message(message, password).map_err(|_| RawHtml("Encryption failed.".to_string()))?;
 
-    // Store the encrypted message
     messages.push(Message {
-        username: username.to_string(),
         content: encrypted_content,
         timestamp,
     });
 
-    // Redirect to the main page, including the username and password in the URL
-    Ok(Redirect::to(format!("/?username={}&password={}", username, password)))
+    Ok(Redirect::to(format!("/")))
 }
 
 // Function to wipe message content securely
 fn wipe_message_content(message: &mut Message) {
-    // Overwrite the message content with zeros
-    let empty_content = vec![0u8; message.content.len()];
-    message.content = String::from_utf8(empty_content).unwrap_or_default();
+    // Securely zero out the message content
+    message.content.zeroize();
 }
 
 // Cleanup task to remove expired messages and securely wipe their contents
@@ -455,20 +261,25 @@ async fn message_cleanup_task(state: Arc<ChatState>) {
         }
     }
 }
-
-#[launch]
-async fn rocket() -> _ {
+// Main function to launch the Rocket server
+#[tokio::main]
+async fn main() {
     let chat_state = Arc::new(ChatState {
-        messages: Arc::new(Mutex::new(vec![])),
+        messages: Arc::new(Mutex::new(Vec::new())),
         user_request_timestamps: Arc::new(Mutex::new(HashMap::new())),
         recent_messages: Arc::new(Mutex::new(HashSet::new())),
+        global_message_timestamps: Arc::new(Mutex::new(Vec::new())),
     });
 
-    // Spawn the message cleanup task
-    let cleanup_task_state = Arc::clone(&chat_state);
-    tokio::spawn(message_cleanup_task(cleanup_task_state));
+    // Launch the message cleanup task
+    tokio::spawn(message_cleanup_task(Arc::clone(&chat_state)));
 
+    // Launch the Rocket application
     rocket::build()
         .manage(chat_state)
-        .mount("/", routes![index, send])
+        .mount("/", routes![index, send, messages])
+        .mount("/static", rocket::fs::FileServer::from("static"))
+        .launch()
+        .await
+        .unwrap(); // Ensure the Rocket server is awaited and handle any errors
 }
