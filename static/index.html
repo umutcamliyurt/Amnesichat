@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Amnesichat</title>
+
+    <script src="/static/crypto-js.min.js"></script>
+    <script src="/static/purify.min.js"></script>
+    <script src="/static/node_modules/argon2-browser/dist/argon2-bundled.min.js"></script>
+    <script src="/static/node_modules/openpgp/dist/openpgp.min.js"></script>
+    <script src="/static/main.js"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <h1>Amnesichat</h1>
+    <div id="info">All messages are first encrypted client-side with OpenPGP then server-side with ChaCha20-Poly1305 and wiped from RAM after 24 hours</div>
+    
+    <noscript>
+        <div class="noscript-overlay">
+            <div class="noscript-message">
+                <h2>JavaScript is Disabled</h2>
+                <p>This chat application requires JavaScript for E2EE functionality. Please enable JavaScript in your browser settings or allow it for this website.</p>
+            </div>
+        </div>
+    </noscript>
+    
+    <div id="chat-container">
+        <h2>Messages:</h2>
+        <div id="messages"></div>
+
+        <!-- Hidden container for raw messages -->
+    <div id="raw_messages" style="display: none;">
+        </div>
+
+        <div id="chat-form">
+            <form id="encrypt-form">
+                <label for="message">Message:</label>
+                <div id="message-input-container">
+                    <input type="text" id="message" placeholder="Type a message..." />
+                    <button id="send-message-button" disabled>
+                        <img src="/static/send.svg" alt="Send Icon" width="24" height="24">
+                    </button>
+                </div>
+                
+        
+                <div id="advanced-options" style="display: none;">
+                    <fieldset>
+                        <legend>PGP Key Management</legend>
+                        <div style="text-align: center;">
+                            <button type="button" class="button" onclick="generatePGPKey()">Generate Key Pair</button>
+                            <button type="button" class="button" onclick="downloadPGPKey()">Download Your Public Key</button>
+                            <button type="button" class="button" onclick="downloadPrivateKey()">Download Your Private Key</button>
+                            <button type="button" class="button" onclick="clearAllPublicKeys()">Clear All Public Keys</button>
+                            <button type="button" class="button" onclick="loadBackup()">Load Backup</button>
+                            <button type="button" class="button" onclick="saveBackup()">Save Backup</button>
+                        </div>
+
+                        <div id="public-key-fingerprints"></div>
+                    </fieldset>
+
+                    <fieldset>
+                        <legend>File Upload</legend>
+                        <div style="text-align: center;">
+                            <label for="image-upload" class="button">Attach an Image</label>
+                            <input type="file" id="image-upload" accept="image/*" onchange="handleImageUpload(event)">
+                        </div>
+                    </fieldset>
+
+                    <fieldset>
+                        <legend>Credentials</legend>
+                        <div class="form-group">
+                            <label for="username">Username:</label>
+                            <input type="text" id="username" name="username" required placeholder="Your username">
+                        </div>
+                        <div class="form-group">
+                            <label for="password">Room Password:</label>
+                            <input type="password" id="password" name="password" placeholder="8+ characters" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="passphrase">Private Key Encryption Password:</label>
+                            <input type="password" id="passphrase" name="passphrase" placeholder="8+ characters" required>
+                        </div>
+                    </fieldset>                    
+
+                    <div class="checkbox-container">
+                        <input type="checkbox" id="tos-checkbox" onclick="toggleSubmitButton()">
+                        <label for="tos-checkbox">I agree to the <a href="javascript:void(0);" id="terms-link">terms of service</a></label>
+                    </div>
+                </div>
+            </form>
+                <div id="toggle-button-container">
+                    <button id="show-form-button" onclick="toggleAdditionalFields()">⚙️ Settings</button>
+                </div>
+        </div>
+    </div>
+
+    <script>
+        // Add an event listener to the form for handling form submission
+        document.getElementById('encrypt-form').addEventListener('submit', encryptMessage);
+    </script>
+    <script>
+        // Add event listener for form submission
+        document.getElementById('encrypt-form').addEventListener('submit', function(event) {
+            event.preventDefault(); // Prevent the default form submission
+    
+            // Get the values from the form fields
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const passphrase = document.getElementById('passphrase').value;
+
+            // Check if password and passphrase meet the requirements
+            if (username && password && passphrase) {
+                // Check if passphrase is at least 8 characters long
+                if (passphrase.length < 8) {
+                    alert('Private Key Encryption Password must be at least 8 characters long!');
+                    // Clear all input fields
+                    clearForm();
+                    return;
+                }
+
+                // Check if the passwords are different
+                if (password === passphrase) {
+                    alert('Room Password and Private Key Encryption Password must be different!');
+                    // Clear all input fields
+                    clearForm();
+                    return;
+                }
+
+                // Save values to localStorage if valid
+                localStorage.setItem('username', username);
+                localStorage.setItem('password', password);
+                localStorage.setItem('passphrase', passphrase);
+            } else {
+                alert('Please fill in both username and password fields!');
+                // Clear all input fields
+                clearForm();
+            }
+        });
+
+        // Function to clear all form input fields
+        function clearForm() {
+            document.getElementById('username').value = "";
+            document.getElementById('password').value = "";
+            document.getElementById('passphrase').value = "";
+        }
+
+    
+        // Function to retrieve the stored credentials from localStorage
+        function getStoredCredentials() {
+            const storedUsername = localStorage.getItem('username');
+            const storedPassword = localStorage.getItem('password');
+            const storedPassphrase = localStorage.getItem('passphrase');
+            return { username: storedUsername, password: storedPassword, passphrase: storedPassphrase };
+        }
+
+        function populateFormWithStoredCredentials() {
+            const { username, password, passphrase } = getStoredCredentials();
+            
+            if (username && password) {
+                document.getElementById('username').value = username;
+                document.getElementById('password').value = password;
+                document.getElementById('passphrase').value = passphrase;
+            }
+        }
+
+        // Function to toggle the submit button based on the checkbox
+        function toggleSubmitButton() {
+            const tosCheckbox = document.getElementById('tos-checkbox');
+            const termsLink = document.getElementById('terms-link');
+            const sendMessageButton = document.getElementById('send-message-button');
+            
+            // Store the checkbox state in localStorage
+            localStorage.setItem('tos-checked', tosCheckbox.checked);
+            
+            // Enable or disable the button based on checkbox state
+            if (tosCheckbox.checked) {
+                sendMessageButton.disabled = false;
+                termsLink.style.color = 'skyblue';
+            } else {
+                sendMessageButton.disabled = true;
+                termsLink.style.color = '#ff000d';
+            }
+        }
+
+        // Automatically open the Terms of Service section when the terms link is clicked
+        document.getElementById('terms-link').addEventListener('click', function() {
+            const termsSection = document.getElementById('terms-of-service-section');
+            if (!termsSection.open) {
+                termsSection.open = true;
+            }
+        });
+    </script>
+<div id="footer">
+    <!-- Main Links -->
+    <div class="main-links">
+        <a href="https://github.com/umutcamliyurt/Amnesichat" target="_blank">Source Code</a>
+        <a href="http://v5wigkntehm3o4v6ssou4nfmnf4u3y6sg22bsspvubov62niztzxhdyd.onion" target="_blank">Onionsite</a>
+        <a href="http://Amnesichat.i2p/?i2paddresshelper=tlotbwh2e7oqnevnqup5gdzimobjjzmll7c2a2mm6hlbip4a7mzq.b32.i2p" target="_blank">Eepsite</a>
+        <a href="monero:8495bkvsReJAvxm8YP5KUQ9BWxh6Ta63eZGjF4HqU4JcUXdQtXBeBGyWte8L95sSJUMUvh5GHD1RcTNebfTNmFgmRX4XJja">Donate Monero</a>
+    </div>
+    
+    <!-- Privacy Policy and Terms of Service Details -->
+    <details id="terms-of-service-section">
+        <summary>Terms of Service</summary>
+        <p>By accessing or using Amnesichat, you agree to be bound by the following terms and conditions:</p>
+        <p>These Terms of Service govern your use of the Amnesichat service. If you do not agree to these terms, you should not use the service.</p>
+        <p>You agree to use Amnesichat solely for lawful purposes. Prohibited activities include, but are not limited to:</p>
+        <p>Engaging in any form of harassment, abuse, or harmful behavior towards others.</p>
+        <p>Sharing illegal content or engaging in illegal activities.</p>
+        <p>Attempting to access, interfere with, or disrupt the service or servers.</p>
+        <p>Impersonating any person or entity or misrepresenting your affiliation with a person or entity.</p>
+        <p>Amnesichat is not responsible for any loss, damage, or harm resulting from your use of the service or any third-party interactions. Use of the service is at your own risk.</p>
+        <p>We reserve the right to modify or discontinue the service at any time without notice. We will not be liable for any modification, suspension, or discontinuance of the service.</p>
+        <p>These Terms of Service shall be governed by and construed in accordance with the laws of Türkiye.</p>
+        <p>We may update these Terms of Service from time to time. We will notify users of any significant changes by posting a notice on our website. Continued use of the service after changes signifies your acceptance of the new terms.</p>
+        <p>If you have any questions regarding these Terms of Service, please contact us at nemesisuks@protonmail.com.</p>
+    </details>
+
+    <details>
+        <summary>Privacy Policy</summary>
+        <p>Your privacy is important to us. This Privacy Policy outlines how we handle your information when you use our services.</p>
+        <p>We do not collect, store, or share any personal information or chat logs from users. All messages are temporary and are deleted once the chat session ends.</p>
+        <p>All communication on Amnesichat is encrypted using industry-standard encryption protocols to ensure your conversations remain private and secure.</p>
+        <p>Our service does not use cookies or any tracking technologies to collect data about your usage. We do not monitor your activities on our platform.</p>
+        <p>We may update this Privacy Policy from time to time to reflect changes in our practices. We encourage you to periodically review this page for the latest information on our privacy practices.</p>
+        <p>If you have any questions about this Privacy Policy or our data practices, please contact us at nemesisuks@protonmail.com.</p>
+    </details>
+</div>
+</body>
+</html>
