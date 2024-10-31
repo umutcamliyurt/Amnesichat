@@ -29,6 +29,7 @@ const ENCRYPTION_IV_SIZE: usize = 16;
 // Constants
 const TIME_WINDOW: u64 = 60;
 const REQUEST_LIMIT: u64 = 5;
+const MAX_USERNAME_LENGTH: usize = 30;
 const MAX_MESSAGE_LENGTH: usize = 200;
 const RECENT_MESSAGE_LIMIT: usize = 1000; // Maximum number of messages
 const MESSAGE_EXPIRY_DURATION: u64 = 86400; // 1 day
@@ -119,23 +120,28 @@ fn format_timestamp(timestamp: u64) -> String {
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
-// Function to check if a user is allowed to send a message
+// Check if a user is allowed to send a message based on rate-limiting
 async fn is_request_allowed(username: &str, state: &ChatState) -> bool {
     let mut timestamps = state.user_request_timestamps.lock().await;
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
+    // Check if the user has made requests before
     if let Some((last_request_time, request_count)) = timestamps.get_mut(username) {
         if current_time - *last_request_time > TIME_WINDOW {
+            // Reset count if the time window has passed
             *last_request_time = current_time;
-            *request_count = 1;
+            *request_count = 1; // Reset count for the new time window
             true
         } else if *request_count < REQUEST_LIMIT {
+            // Increment count if within limits
             *request_count += 1;
             true
         } else {
+            // Rate limit exceeded
             false
         }
     } else {
+        // New user, initialize their count
         timestamps.insert(username.to_string(), (current_time, 1));
         true
     }
@@ -360,10 +366,10 @@ async fn index(username: Option<String>, password: Option<String>, state: &State
                     <p>These Terms of Service govern your use of the Amnesichat service. If you do not agree to these terms, you should not use the service.</p>
                     <p>You agree to use Amnesichat solely for lawful purposes. Prohibited activities include, but are not limited to:</p>
                     <ul>
-                        <li>Engaging in any form of harassment, abuse, or harmful behavior towards others.</li>
-                        <li>Sharing illegal content or engaging in illegal activities.</li>
-                        <li>Attempting to access, interfere with, or disrupt the service or servers.</li>
-                        <li>Impersonating any person or entity or misrepresenting your affiliation with a person or entity.</li>
+                        Engaging in any form of harassment, abuse, or harmful behavior towards others.
+                        Sharing illegal content or engaging in illegal activities.
+                        Attempting to access, interfere with, or disrupt the service or servers.
+                        Impersonating any person or entity or misrepresenting your affiliation with a person or entity.
                     </ul>
                     <p>Amnesichat is not responsible for any loss, damage, or harm resulting from your use of the service or any third-party interactions. Use of the service is at your own risk.</p>
                     <p>We reserve the right to modify or discontinue the service at any time without notice. We will not be liable for any modification, suspension, or discontinuance of the service.</p>
@@ -395,6 +401,11 @@ async fn send(username: String, message: String, password: String, state: &State
 
     // Delay message processing by 10 seconds
     sleep(Duration::from_secs(10)).await;
+
+    // Check if the username length exceeds the maximum limit
+    if username.len() > MAX_USERNAME_LENGTH {
+        return Err(RawHtml("Username is too long. Please use a shorter username.".to_string()));
+    }
 
     // Validate the request frequency limit
     if !is_request_allowed(username, state).await {

@@ -33,11 +33,12 @@ By using this service, you agree to the terms of service and acknowledge that yo
 ## Installation:
 
     sudo apt update
-    sudo apt install curl build-essential rustc git
+    sudo apt install curl build-essential git
+    curl https://sh.rustup.rs -sSf | sh -s -- -y
     git clone https://github.com/umutcamliyurt/Amnesichat.git
     cd Amnesichat/
-    sudo cargo build --release
-    sudo cargo run --release
+    cargo build --release
+    cargo run --release
 
 ## Run with Docker:
     
@@ -45,8 +46,8 @@ By using this service, you agree to the terms of service and acknowledge that yo
     sudo apt install docker.io git
     git clone https://github.com/umutcamliyurt/Amnesichat.git
     cd Amnesichat/
-    docker build -t amnesichat:latest .
-    docker run -p 80:80 amnesichat:latest
+    sudo docker build -t amnesichat:latest .
+    sudo docker run -p 8080:8080 amnesichat:latest
 
 ## Requirements:
 
