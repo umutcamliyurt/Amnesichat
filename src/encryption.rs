@@ -6,10 +6,10 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-/// Derive encryption key from room password using SHA-256
-pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+/// Derive encryption key from room room_id using SHA-256
+pub fn derive_key(room_id: &str, salt: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
+    hasher.update(room_id.as_bytes());
     hasher.update(salt);
     let result = hasher.finalize();
     let mut key = [0u8; 32];
@@ -18,11 +18,11 @@ pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 }
 
 // Encrypt the message using ChaCha20Poly1305
-pub fn encrypt_message(plain_text: &str, password: &str) -> Result<String, &'static str> {
+pub fn encrypt_message(plain_text: &str, room_id: &str) -> Result<String, &'static str> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
 
-    let mut key = derive_key(password, &salt);
+    let mut key = derive_key(room_id, &salt);
     let cipher = ChaCha20Poly1305::new(&Key::from_slice(&key));
 
     let mut nonce_bytes = [0u8; 12];
@@ -44,7 +44,7 @@ pub fn encrypt_message(plain_text: &str, password: &str) -> Result<String, &'sta
 }
 
 // Decrypt the message using ChaCha20Poly1305
-pub fn decrypt_message(encrypted_text: &str, password: &str) -> Result<String, &'static str> {
+pub fn decrypt_message(encrypted_text: &str, room_id: &str) -> Result<String, &'static str> {
     let parts: Vec<&str> = encrypted_text.split(':').collect();
     if parts.len() != 3 {
         return Err("Invalid encrypted message format");
@@ -54,7 +54,7 @@ pub fn decrypt_message(encrypted_text: &str, password: &str) -> Result<String, &
     let nonce_bytes = hex::decode(parts[1]).map_err(|_| "Decryption error")?;
     let encrypted_data = hex::decode(parts[2]).map_err(|_| "Decryption error")?;
 
-    let mut key = derive_key(password, &salt);
+    let mut key = derive_key(room_id, &salt);
     let cipher = ChaCha20Poly1305::new(&Key::from_slice(&key));
 
     let nonce = Nonce::from_slice(&nonce_bytes);

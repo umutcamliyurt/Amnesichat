@@ -15,9 +15,13 @@ Amnesichat offers several key benefits, particularly in enhancing user privacy a
 
 - Forward and backward secrecy
 
+- Group chat support using PSK (pre-shared-key)
+
 - Server runs even on cheapest hardware
 
 - Each message is stored encrypted in server's RAM and wiped after 24 hours
+
+- All traffic is routed over Tor network by default
 
 - Docker support
 
@@ -26,7 +30,7 @@ Amnesichat offers several key benefits, particularly in enhancing user privacy a
 ## Technical details:
 
 - Amnesichat Protocol for end-to-end encryption
-- Stores identity keys in local storage encrypted with ChaCha20-Poly1305 and Argon2id with an user specified password
+- Stores identity keys in local storage encrypted with ChaCha20-Poly1305 and Argon2id KDF with an user specified password
 
 ### Amnesichat Protocol:
 - EdDSA and Dilithium5 for authentication, ECDH and Kyber1024 for key exchange, encryption using ChaCha20-Poly1305
@@ -51,37 +55,27 @@ Amnesichat offers several key benefits, particularly in enhancing user privacy a
     sudo docker build -t amnesichat:latest .
     sudo docker run -p 8080:8080 amnesichat:latest
 
-## Client usage (Rust):
+## Client usage:
 
     sudo apt update
     sudo apt install curl build-essential git
     curl https://sh.rustup.rs -sSf | sh -s -- -y
     git clone https://github.com/umutcamliyurt/Amnesichat.git
     cd Amnesichat/client/
+    chmod +x setup_tor_http_proxy.sh
+    ./setup_tor_http_proxy.sh
     cargo build --release
     cargo run --release
 
-## Client usage (Python):
-
-    sudo apt update
-    git clone --depth=1 https://github.com/open-quantum-safe/liboqs-python
-    cd liboqs-python
-    sudo apt-get install python3 python3-pip cmake libssl-dev
-    pip3 install .
-    cd ..
-    git clone https://github.com/umutcamliyurt/Amnesichat.git
-    cd Amnesichat/
-    pip3 install -r requirements.txt
-    python3 gui.py
-
 ## Requirements:
 
-- Any modern web browser or [Python](https://www.python.org/downloads/) for client
-- [Rust](https://www.rust-lang.org) or [Docker](https://www.docker.com/) for server
+- [Rust](https://www.rust-lang.org)
+- [Tor](https://gitlab.torproject.org/tpo/core/tor)
 
 <!-- SCREENSHOT -->
 ## Screenshot:
-![screenshot](screenshot.png)
+
+![Screenshot](screenshot.png)
 
 <!-- LICENSE -->
 ## License

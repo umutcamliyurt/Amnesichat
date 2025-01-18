@@ -1,6 +1,0 @@
-[workspace]
-members=[
-  "oqs-sys",
-  "oqs",
-]
-resolver = "2"

@@ -34,7 +34,7 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct MessageData {
     message: String,
-    password: String,
+    room_id: String,
 }
 
 #[derive(Debug)]
@@ -103,8 +103,8 @@ async fn is_message_valid(message: &str, state: &ChatState) -> bool {
     true
 }
 
-#[get("/messages?<password>")]
-async fn messages(password: Option<String>, state: &State<Arc<ChatState>>) -> String {
+#[get("/messages?<room_id>")]
+async fn messages(room_id: Option<String>, state: &State<Arc<ChatState>>) -> String {
     let chat_state = state.inner();
     let messages = chat_state.messages.lock().await;
 
@@ -113,13 +113,13 @@ async fn messages(password: Option<String>, state: &State<Arc<ChatState>>) -> St
         // Format timestamp for display
         let timestamp = format_timestamp(message.timestamp);
 
-        // Decrypt message content based on the provided password, if available
-        let decrypted_content = match &password {
+        // Decrypt message content based on the provided room_id, if available
+        let decrypted_content = match &room_id {
             Some(ref pw) => decrypt_message(&message.content, pw).unwrap_or_else(|_| {
                 // Return nothing when decryption fails
                 return String::new();  // Empty string will effectively remove the message from HTML
             }),
-            None => String::new(),  // No password provided, return empty content
+            None => String::new(),  // No room_id provided, return empty content
         };
 
         // If decryption fails (decrypted_content is empty), skip appending the message
@@ -138,22 +138,22 @@ async fn messages(password: Option<String>, state: &State<Arc<ChatState>>) -> St
     html
 }
 
-#[get("/?<password>")]
-async fn index(password: Option<String>, state: &State<Arc<ChatState>>) -> Result<RawHtml<String>, Status> {
+#[get("/?<room_id>")]
+async fn index(room_id: Option<String>, state: &State<Arc<ChatState>>) -> Result<RawHtml<String>, Status> {
     // Read the static HTML template
     let mut html = tokio::fs::read_to_string("static/index.html")
         .await
         .map_err(|_error| Status::InternalServerError)?;
 
-    // Get password, defaulting to empty string if not provided
+    // Get room_id, defaulting to empty string if not provided
     // Safely handle temporary value by assigning them to variable
-    let password_value = password.clone().unwrap_or_else(|| "".to_string());
+    let room_id_value = room_id.clone().unwrap_or_else(|| "".to_string());
 
     // Safely encode them using encode_text.
-    let encoded_password = encode_text(&password_value);
+    let encoded_room_id = encode_text(&room_id_value);
 
     // Replace placeholder with actual values
-    html = html.replace("PASSWORD_PLACEHOLDER", &encoded_password);
+    html = html.replace("room_id_PLACEHOLDER", &encoded_room_id);
 
     // Get current chat messages and generate HTML for them
     let messages = state.messages.lock().await;
@@ -162,11 +162,11 @@ async fn index(password: Option<String>, state: &State<Arc<ChatState>>) -> Resul
     for msg in messages.iter() {
         let timestamp = format_timestamp(msg.timestamp);
 
-        // Decrypt message content based on provided password
-        let decrypted_content = if let Some(ref pw) = password {
+        // Decrypt message content based on provided room_id
+        let decrypted_content = if let Some(ref pw) = room_id {
             decrypt_message(&msg.content, pw).unwrap_or_else(|_| "Decryption failed".to_string())
         } else {
-            "Password not provided".to_string()
+            "room_id not provided".to_string()
         };
 
         // Add the message to the HTML string
@@ -188,7 +188,7 @@ async fn index(password: Option<String>, state: &State<Arc<ChatState>>) -> Resul
 #[post("/send", data = "<message_data>")]
 async fn send(message_data: Json<MessageData>, state: &State<Arc<ChatState>>) -> Result<Redirect, RawHtml<String>> {
     let message = message_data.message.trim();
-    let password = message_data.password.trim();
+    let room_id = message_data.room_id.trim();
 
     // Delay message processing by 2 seconds
     sleep(Duration::from_secs(2)).await;
@@ -198,14 +198,14 @@ async fn send(message_data: Json<MessageData>, state: &State<Arc<ChatState>>) ->
         return Err(RawHtml("Too many messages sent in a short period. Please wait for 2 minutes.".to_string()));
     }
 
-    // Reject the request if the room password field is empty
-    if password.is_empty() {
-        return Err(RawHtml("Room password cannot be empty. Please provide a password.".to_string()));
+    // Reject the request if the room room_id field is empty
+    if room_id.is_empty() {
+        return Err(RawHtml("Room room_id cannot be empty. Please provide a room_id.".to_string()));
     }
 
-    // Check if the password is at least 8 characters long
-    if password.len() < 8 {
-        return Err(RawHtml("Room password must be at least 8 characters long.".to_string()));
+    // Check if the room_id is at least 8 characters long
+    if room_id.len() < 8 {
+        return Err(RawHtml("Room room_id must be at least 8 characters long.".to_string()));
     }
 
     // Check if the message is valid (length and total message count)
@@ -221,7 +221,7 @@ async fn send(message_data: Json<MessageData>, state: &State<Arc<ChatState>>) ->
     let mut messages = state.messages.lock().await;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    let encrypted_content = encrypt_message(message, password).map_err(|_| RawHtml("Encryption failed.".to_string()))?;
+    let encrypted_content = encrypt_message(message, room_id).map_err(|_| RawHtml("Encryption failed.".to_string()))?;
 
     messages.push(Message {
         content: encrypted_content,

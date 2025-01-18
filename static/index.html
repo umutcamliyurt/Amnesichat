@@ -57,15 +57,12 @@
                 <h2>Installation Instructions</h2>
                 <pre>
 sudo apt update
-git clone --depth=1 https://github.com/open-quantum-safe/liboqs-python
-cd liboqs-python
-sudo apt-get install python3 python3-pip cmake libssl-dev
-pip3 install .
-cd ..
+sudo apt install curl build-essential git
+curl https://sh.rustup.rs -sSf | sh -s -- -y
 git clone https://github.com/umutcamliyurt/Amnesichat.git
-cd Amnesichat/
-pip3 install -r requirements.txt
-python3 gui.py
+cd Amnesichat/client/
+cargo build --release
+cargo run --release
 </pre>
             </div>
     </div>

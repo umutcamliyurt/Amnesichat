@@ -1,8 +1,11 @@
+mod gui;
+use crate::gui::run_gui;
 use oqs::*;
-use oqs::sig::{Sig, PublicKey, SecretKey, Signature};
+use oqs::sig::{Sig, PublicKey, SecretKey, Algorithm as SigAlgorithm};
 use oqs::kem::{Kem, Algorithm};
 use std::fs::File;
 use std::process::Command;
+use std::{thread, time::Duration};
 use base64::{Engine, engine::general_purpose};
 use hex;
 use std::io::{self, Write, Read};
@@ -12,9 +15,6 @@ use std::result::Result;
 use std::{
     collections::HashSet,
     error::Error,
-    sync::Arc,
-    thread,
-    time::Duration,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -31,12 +31,12 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
 // Function to get the raw bytes from PublicKey
 fn get_raw_bytes_public_key(pk: &PublicKey) -> &[u8] {
-    pk.raw_bytes() // Directly return the raw bytes
+    pk.as_ref() // Directly return the raw bytes
 }
 
 // Function to get the raw bytes from SecretKey
 fn get_raw_bytes_secret_key(sk: &SecretKey) -> &[u8] {
-    sk.raw_bytes() // Directly return the raw bytes
+    sk.as_ref() // Directly return the raw bytes
 }
 
 fn save_dilithium_keys_to_file(public_key: &PublicKey, secret_key: &SecretKey, user: &str, password: &str) -> io::Result<()> {
@@ -64,33 +64,40 @@ fn save_dilithium_keys_to_file(public_key: &PublicKey, secret_key: &SecretKey, u
     Ok(())
 }
 
-fn load_dilithium_keys_from_file(sig: &Sig, user: &str, password: &str) -> io::Result<(PublicKey, SecretKey)> {
-    // Load the encrypted keys from files
+fn load_dilithium_keys_from_file(sigalg: &Sig, user: &str, password: &str) -> io::Result<(PublicKey, SecretKey)> {
+    // Load the encrypted public key from file
     let mut pub_file = File::open(format!("{}_dilithium_public_key.enc", user))?;
     let mut pub_encrypted = String::new();
     pub_file.read_to_string(&mut pub_encrypted)?;
 
+    // Load the encrypted secret key from file
     let mut sec_file = File::open(format!("{}_dilithium_secret_key.enc", user))?;
     let mut sec_encrypted = String::new();
     sec_file.read_to_string(&mut sec_encrypted)?;
 
-    // Decrypt the base64-encoded keys
+    // Decrypt the base64-encoded keys using the provided password
     let decrypted_pub = decrypt_data(&pub_encrypted, password)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption error: {}", e)))?;
     let decrypted_sec = decrypt_data(&sec_encrypted, password)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption error: {}", e)))?;
 
-    // Decode the Base64-encoded keys
+    // Decode the decrypted Base64-encoded keys
     let pub_bytes = general_purpose::STANDARD.decode(&decrypted_pub)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode public key"))?;
     let sec_bytes = general_purpose::STANDARD.decode(&decrypted_sec)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode secret key"))?;
 
-    // Use the provided `sig` to validate and create keys from raw bytes
-    let public_key = PublicKey::from_bytes(sig, &pub_bytes)
-        .ok_or(io::Error::new(io::ErrorKind::InvalidData, "Invalid public key"))?;
-    let secret_key = SecretKey::from_bytes(sig, &sec_bytes)
-        .ok_or(io::Error::new(io::ErrorKind::InvalidData, "Invalid secret key"))?;
+    // Create public and secret key objects from the byte data
+    let public_key_ref = sigalg
+        .public_key_from_bytes(&pub_bytes)
+        .ok_or(io::Error::new(io::ErrorKind::InvalidData, "Invalid public key data"))?;
+    let secret_key_ref = sigalg
+        .secret_key_from_bytes(&sec_bytes)
+        .ok_or(io::Error::new(io::ErrorKind::InvalidData, "Invalid secret key data"))?;
+
+    // Clone the references to get owned keys
+    let public_key = public_key_ref.to_owned();
+    let secret_key = secret_key_ref.to_owned();
 
     Ok((public_key, secret_key))
 }
@@ -226,16 +233,32 @@ fn key_operations_eddsa(
     }
 }
 
+// Function to create the reqwest blocking client with HTTP proxy support via Tor
+fn create_client_with_proxy(proxy: &str) -> Client {
+    // The proxy is where Tor's HTTP service is running, typically 127.0.0.1:8118
+
+    // Now, create the reqwest client with custom transport handling the proxy
+    let transport = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true) // Allow invalid certificates for testing
+        .proxy(reqwest::Proxy::all(proxy).unwrap()) // Route through Tor proxy
+        .build()
+        .unwrap();
+
+    transport
+}
+
 // Structures for public keys and ciphertext
 #[derive(Serialize, Deserialize)]
 struct Message {
     message: String,
-    password: String,
+    room_id: String,
 }
 
 fn fetch_kyber_pubkey(password: &str, server_url: &str) -> Option<String> {
-    let client = Client::new();
-    let url = format!("{}/messages?password={}", server_url, password); // Use server_url
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+    
+    let url = format!("{}/messages?room_id={}", server_url, password);
     let mut retries = 0;
     let max_retries = 3;
 
@@ -286,8 +309,10 @@ fn fetch_kyber_pubkey(password: &str, server_url: &str) -> Option<String> {
 }
 
 fn fetch_dilithium_pubkeys(password: &str, server_url: &str) -> Vec<String> {
-    let client = Client::new();
-    let url = format!("{}/messages?password={}", server_url, password); // Use server_url
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
+    let url = format!("{}/messages?room_id={}", server_url, password);
     let mut retries = 0;
     let max_retries = 3;
 
@@ -345,14 +370,11 @@ fn fetch_dilithium_pubkeys(password: &str, server_url: &str) -> Vec<String> {
     }
 }
 
-
 fn fetch_eddsa_pubkeys(password: &str, server_url: &str) -> Vec<String> {
-    use reqwest::blocking::{Client, Response};
-    use std::thread;
-    use std::time::Duration;
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
 
-    let client = Client::new();
-    let url = format!("{}/messages?password={}", server_url, password);
+    let url = format!("{}/messages?room_id={}", server_url, password);
     let mut retries = 0;
     let max_retries = 3;
 
@@ -411,8 +433,10 @@ fn fetch_eddsa_pubkeys(password: &str, server_url: &str) -> Vec<String> {
 }
 
 fn fetch_ciphertext(password: &str, server_url: &str) -> String {
-    let client = Client::new();
-    let url = format!("{}/messages?password={}", server_url, password);
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
+    let url = format!("{}/messages?room_id={}", server_url, password);
 
     loop {
         let res: Response = match client.get(&url).send() {
@@ -448,12 +472,14 @@ fn fetch_ciphertext(password: &str, server_url: &str) -> String {
     }
 }
 
-fn send_kyber_pubkey(password: &str, public_key: &str, url: &str) {
-    let client = Client::new();
+fn send_kyber_pubkey(room_id: &str, public_key: &str, url: &str) {
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
     let full_url = format!("{}/send", url); // Append /send to the URL
     let message = Message {
         message: format!("KYBER_PUBLIC_KEY:{}[END DATA]", public_key),
-        password: password.to_string(),
+        room_id: room_id.to_string(),
     };
 
     let res = client.post(&full_url).json(&message).send(); // Use the full URL
@@ -471,12 +497,14 @@ fn send_kyber_pubkey(password: &str, public_key: &str, url: &str) {
     }
 }
 
-fn send_dilithium_pubkey(password: &str, public_key: &str, url: &str) {
-    let client = Client::new();
+fn send_dilithium_pubkey(room_id: &str, public_key: &str, url: &str) {
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
     let full_url = format!("{}/send", url); // Append /send to the URL
     let message = Message {
         message: format!("DILITHIUM_PUBLIC_KEY:{}[END DATA]", public_key),
-        password: password.to_string(),
+        room_id: room_id.to_string(),
     };
 
     let res = client.post(&full_url).json(&message).send(); // Use the full URL
@@ -494,29 +522,39 @@ fn send_dilithium_pubkey(password: &str, public_key: &str, url: &str) {
     }
 }
 
-fn send_eddsa_pubkey(password: &str, public_key: &str, url: &str) {
-    let client = Client::new();
+fn send_eddsa_pubkey(room_id: &str, public_key: &str, url: &str) {
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
     let full_url = format!("{}/send", url); // Append /send to the URL
     let message = Message {
         message: format!("EDDSA_PUBLIC_KEY:{}[END DATA]", public_key),
-        password: password.to_string(),
+        room_id: room_id.to_string(),
     };
 
-    let res: Response = client.post(&full_url).json(&message).send().unwrap(); // Use the full URL
+    let res: Response = match client.post(&full_url).json(&message).send() {
+        Ok(response) => response,
+        Err(_) => {
+            println!("Failed to send the public key.");
+            return;
+        }
+    };
 
     if res.status().is_success() {
         println!("EdDSA public key sent successfully!");
     } else {
-        println!("Failed to send public key");
+        println!("Failed to send public key.");
     }
 }
 
-fn send_ciphertext(password: &str, ciphertext: &str, url: &str) {
-    let client = Client::new();
+fn send_ciphertext(room_id: &str, ciphertext: &str, url: &str) {
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
     let full_url = format!("{}/send", url); // Append /send to the URL
     let message = Message {
         message: format!("KYBER_PUBLIC_KEY:CIPHERTEXT:{}[END DATA]", ciphertext),
-        password: password.to_string(),
+        room_id: room_id.to_string(),
     };
 
     let res: Response = client.post(&full_url).json(&message).send().unwrap(); // Use the full URL
@@ -530,7 +568,7 @@ fn send_ciphertext(password: &str, ciphertext: &str, url: &str) {
 
 
 fn kyber_key_exchange(
-    room_password: &str,
+    room_id: &str,
     dilithium_pks: &[oqs::sig::PublicKey],
     dilithium_sk: &oqs::sig::SecretKey,
     server_url: &str, // Added server URL parameter
@@ -542,7 +580,7 @@ fn kyber_key_exchange(
     let (kem_pk, kem_sk) = kemalg.keypair()?;
     let kem_pk_hex = hex::encode(kem_pk.as_ref());
 
-    let public_key = fetch_kyber_pubkey(room_password, server_url); // Pass server_url
+    let public_key = fetch_kyber_pubkey(room_id, server_url); // Pass server_url
     let is_alice = match public_key {
         Some(ref key) if !key.is_empty() => {
             println!("Fetched public key: {}", key);
@@ -550,13 +588,13 @@ fn kyber_key_exchange(
         }
         _ => {
             println!("No valid public key found. Sending own Kyber public key.");
-            send_kyber_pubkey(room_password, &kem_pk_hex, server_url); // Pass server_url
+            send_kyber_pubkey(room_id, &kem_pk_hex, server_url); // Pass server_url
             true
         }
     };
 
     let shared_secret_result = if is_alice {
-        let ciphertext = fetch_ciphertext(room_password, server_url); // Pass server_url
+        let ciphertext = fetch_ciphertext(room_id, server_url); // Pass server_url
         // Find the "-----BEGIN SIGNATURE-----" delimiter
         let start_pos = ciphertext.find("-----BEGIN SIGNATURE-----").ok_or("Signature start not found")?;
         // Extract the ciphertext before the signature part (i.e., before the "-----BEGIN SIGNATURE-----")
@@ -602,7 +640,7 @@ fn kyber_key_exchange(
         let ciphertext_signature = sign_data_with_dilithium(kem_ct.as_ref(), dilithium_sk)?;
         println!("Bob signed the ciphertext: {}", ciphertext_signature);
 
-        send_ciphertext(room_password, &ciphertext_signature, server_url); // Pass server_url
+        send_ciphertext(room_id, &ciphertext_signature, server_url); // Pass server_url
 
         let mut hasher = Sha256::new();
         hasher.update(shared_secret.as_ref());
@@ -656,7 +694,7 @@ fn verify_signature_with_dilithium(data: &[u8], dilithium_pk: &oqs::sig::PublicK
     let sigalg = Sig::new(oqs::sig::Algorithm::Dilithium5)?;
     
     // Attempt to convert the signature bytes to a valid signature
-    let signature_ref = match Signature::from_bytes(&sigalg, &signature_bytes) {
+    let signature_ref = match (&sigalg).signature_from_bytes(&signature_bytes) {
         Some(sig) => sig,
         None => return Err("Invalid signature".into()),
     };
@@ -725,12 +763,13 @@ fn verify_signature_with_eddsa(signature_with_data: &str, eddsa_pk: &Ed25519Publ
 #[derive(Serialize, Deserialize, Debug)] // Make sure it can be serialized and deserialized
 struct MessageData {
     message: String,
-    password: String,
+    room_id: String,
 }
 
-fn fingerprint_dilithium_public_key(public_key: &oqs::sig::PublicKey) -> String {
-    // Hash the public key to generate a fingerprint (using SHA-256)
-    let hashed = Sha256::digest(public_key.raw_bytes());
+fn fingerprint_dilithium_public_key(public_key: &PublicKey) -> String {
+    // Access the raw bytes of the public key using as_ref()
+    let raw_bytes = public_key.as_ref(); // This should return &[u8]
+    let hashed = Sha256::digest(raw_bytes);
     hex::encode(hashed)
 }
 
@@ -764,33 +803,195 @@ fn request_user_confirmation(fingerprint: &str, own_fingerprint: &str) -> Result
     }
 }
 
+fn generate_random_room_id() -> String {
+    const ID_LENGTH: usize = 16;
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    let mut rng = OsRng;
+    let mut room_id = String::with_capacity(ID_LENGTH);
+
+    for _ in 0..ID_LENGTH {
+        let idx = (rng.next_u32() as usize) % CHARSET.len();
+        room_id.push(CHARSET[idx] as char);
+    }
+
+    room_id
+}
+
+// The main function
 fn main() -> Result<(), Box<dyn Error>> {
+    use std::sync::{Arc, Mutex};
+    use std::{io::{self, Write}, thread, time::Duration};
+
     let sigalg = sig::Sig::new(sig::Algorithm::Dilithium5)?;
 
-    // Step 1: Get user input for username, room password, and server URL
+    // Get user input for the choice of interface
     let mut input = String::new();
+    print!("Choose interface (CLI or GUI): ");
+    io::stdout().flush()?;
+    io::stdin().read_line(&mut input)?;
+    let interface_choice = input.trim().to_string();
+    input.clear();
 
+    // Step 1: Ask user to either create a room ID or join one
+    println!("Would you like to create a new room or join an existing one?");
+    println!("Type 'create' to create a new room or 'join' to join an existing one.");
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+
+    let room_id = match choice {
+        "create" => {
+            let new_room_id = generate_random_room_id();
+            println!("Generated new room ID: {}", new_room_id);
+            new_room_id
+        }
+        "join" => {
+            println!("Enter the room ID to join:");
+            let mut room_input = String::new();
+            io::stdin().read_line(&mut room_input)?;
+            room_input.trim().to_string()
+        }
+        _ => {
+            println!("Invalid choice. Please restart the program and choose 'create' or 'join'.");
+            return Ok(());
+        }
+    };
+
+    // Get the server URL
     print!("Enter the server URL: ");
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let url = input.trim().to_string();
     input.clear();
 
+    // Get the username
     print!("Enter your username: ");
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let username = input.trim().to_string();
     input.clear();
 
-    print!("Enter room password: ");
-    io::stdout().flush()?;
-    io::stdin().read_line(&mut input)?;
-    let room_password = input.trim().to_string();
-
     print!("Enter private key encryption password: ");
     io::stdout().flush()?;
     let private_password = read_password()?.to_string();
 
+    println!("Is this a group chat? (yes/no): ");
+    let mut is_group_chat = String::new();
+    io::stdin().read_line(&mut is_group_chat)?;
+    let is_group_chat = is_group_chat.trim().to_lowercase() == "yes";
+
+    let room_password = if is_group_chat {
+        // Loop to get a valid room password for group chat
+        loop {
+            print!("Enter room password (must be longer than 8 characters): ");
+            io::stdout().flush()?; // Ensure the prompt is displayed immediately
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let password_input = input.trim();
+            if password_input.len() > 8 {
+                break password_input.to_string(); // Exit the loop with valid password
+            } else {
+                println!("Error: Password must be longer than 8 characters. Please try again.");
+            }
+        }
+    } else {
+        // For one-to-one chat, skip password setup
+        String::new()
+    };
+
+    // Derive the key from the room password if it's a group chat
+    let room_password = if is_group_chat {
+        let salt = derive_salt_from_password(&room_password);
+        let key = derive_key(&room_password, &salt);
+        hex::encode(key)
+    } else {
+        String::new() // No room password required for one-to-one chat
+    };
+
+    // Skip key exchange and create hybrid_shared_secret if it's a group chat
+    if is_group_chat {
+        println!("Skipping key exchange. Using room password as shared secret.");
+        let hybrid_shared_secret = room_password.clone();  // Use room password directly
+        println!("Shared secret established.");
+        println!("You can now start messaging!");
+
+        // Shared data setup for messaging
+        let shared_hybrid_secret = Arc::new(hybrid_shared_secret.clone());
+        let shared_room_id = Arc::new(Mutex::new(room_id.clone()));
+        let shared_url = Arc::new(Mutex::new(url.clone()));
+
+        // Spawn message fetch thread
+        let fetch_thread = {
+            let shared_hybrid_secret = Arc::clone(&shared_hybrid_secret);
+            let shared_room_id = Arc::clone(&shared_room_id);
+            let shared_url = Arc::clone(&shared_url);
+
+            thread::spawn(move || loop {
+                let room_id_locked = shared_room_id.lock().unwrap();
+                let url_locked = shared_url.lock().unwrap();
+
+                match receive_and_fetch_messages(
+                    &room_id_locked,
+                    &shared_hybrid_secret,
+                    &url_locked,
+                    true,
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Error fetching messages: {}", e);
+                    }
+                }
+                thread::sleep(Duration::from_secs(10));
+            })
+        };
+
+        // Handle GUI or CLI messaging
+        if interface_choice.to_lowercase() == "gui" {
+            let shared_hybrid_secret_for_gui = shared_hybrid_secret;
+            let shared_room_id_for_gui: Arc<String> = {
+                let locked = shared_room_id.lock().unwrap();
+                Arc::new(locked.clone())
+            };
+            let shared_url_for_gui: Arc<String> = {
+                let locked = shared_url.lock().unwrap();
+                Arc::new(locked.clone())
+            };
+            let _ = run_gui(
+                username.clone(),
+                shared_hybrid_secret_for_gui,
+                shared_room_id_for_gui,
+                shared_url_for_gui,
+            );
+        } else {
+            loop {
+                let mut message = String::new();
+                print!("Enter your message (or type 'exit' to quit): ");
+                io::stdout().flush()?;
+                io::stdin().read_line(&mut message)?;
+
+                let message = message.trim();
+
+                if message == "exit" {
+                    println!("Exiting messaging session.");
+                    break;
+                }
+
+                let message = format!("<strong>{}</strong>: {}", username, message);
+
+                let encrypted_message = encrypt_data(&message, &hybrid_shared_secret)?;
+                send_encrypted_message(&encrypted_message, &room_id, &url)?;
+            }
+        }
+
+        if let Err(e) = fetch_thread.join() {
+            eprintln!("Fetch thread terminated with error: {:?}", e);
+        }
+
+        return Ok(());
+    }
+
+    // Continue with the key exchange process for one-to-one chat
     // Step 2: Load or generate Dilithium5 and EdDSA keys for the user
     let dilithium_keys = key_operations_dilithium(&sigalg, &username, &private_password);
     let Ok((dilithium_pk, dilithium_sk)) = dilithium_keys else { todo!() };
@@ -799,10 +1000,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let Ok((eddsa_sk, eddsa_pk)) = eddsa_keys else { todo!() };
 
     let encoded_dilithium_pk = hex::encode(&dilithium_pk);
-    send_dilithium_pubkey(&room_password, &encoded_dilithium_pk, &url);
+    send_dilithium_pubkey(&room_id, &encoded_dilithium_pk, &url);
 
     let encoded_eddsa_pk = hex::encode(&eddsa_pk);
-    send_eddsa_pubkey(&room_password, &encoded_eddsa_pk, &url);
+    send_eddsa_pubkey(&room_id, &encoded_eddsa_pk, &url);
 
     let fingerprint_dilithium = fingerprint_dilithium_public_key(&dilithium_pk);
 
@@ -827,25 +1028,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     while all_other_dilithium_keys.len() < 1 {
         println!("Waiting for Dilithium public key...");
         thread::sleep(Duration::from_secs(5));
-
-        let encoded_other_dilithium_pks = fetch_dilithium_pubkeys(&room_password, &url);
-
+    
+        let encoded_other_dilithium_pks = fetch_dilithium_pubkeys(&room_id, &url);
+    
         for encoded_pk in encoded_other_dilithium_pks {
             if let Ok(decoded_pk) = hex::decode(&encoded_pk) {
-                let public_key = oqs::sig::PublicKey::from_bytes(&sigalg, &decoded_pk);
-
-                if let Some(public_key) = public_key {
+    
+                // Create a Sig instance for the "Dilithium5" algorithm
+                let algorithm = SigAlgorithm::Dilithium5;
+    
+                // Create a Sig instance for the chosen algorithm
+                let sig = Sig::new(algorithm).map_err(|_| "Failed to initialize signature scheme")?;
+    
+                // Convert the decoded public key to a PublicKey using public_key_from_bytes
+                if let Some(public_key_ref) = sig.public_key_from_bytes(&decoded_pk) {
+                    // Convert PublicKeyRef<'_> to PublicKey by calling to_owned()
+                    let public_key = public_key_ref.to_owned();
+    
                     let fetched_fingerprint = fingerprint_dilithium_public_key(&public_key);
-
+    
                     if fetched_fingerprint == fingerprint_dilithium {
                         continue;
                     }
-
+    
                     if processed_fingerprints.contains(&fetched_fingerprint) {
                         continue;
                     }
-
+    
                     if request_user_confirmation(&fetched_fingerprint, &fingerprint_dilithium)? {
+                        // Push the owned PublicKey to the list
                         all_other_dilithium_keys.push(public_key);
                         processed_fingerprints.insert(fetched_fingerprint);
                     } else {
@@ -859,6 +1070,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    
+    
 
     println!("Received Dilithium5 public key from the server.");
 
@@ -868,7 +1081,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Waiting for EdDSA public key...");
         thread::sleep(Duration::from_secs(5));
 
-        let encoded_other_eddsa_pks = fetch_eddsa_pubkeys(&room_password, &url);
+        let encoded_other_eddsa_pks = fetch_eddsa_pubkeys(&room_id, &url);
 
         for encoded_pk in encoded_other_eddsa_pks {
             if let Ok(decoded_pk) = hex::decode(&encoded_pk) {
@@ -906,9 +1119,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut all_dilithium_pks = vec![dilithium_pk];
     all_dilithium_pks.extend(all_other_dilithium_keys);
 
-    let kyber_shared_secret = kyber_key_exchange(&room_password, &all_dilithium_pks, &dilithium_sk, &url)?;
+    let kyber_shared_secret = kyber_key_exchange(&room_id, &all_dilithium_pks, &dilithium_sk, &url)?;
     let ecdh_shared_secret = if let Some(ref eddsa_key) = eddsa_key {
-        perform_ecdh_key_exchange(&room_password, &eddsa_sk.to_bytes(), eddsa_key, &url)?
+        perform_ecdh_key_exchange(&room_id, &eddsa_sk.to_bytes(), eddsa_key, &url)?
     } else {
         return Err("EdDSA public key is missing".into());
     };
@@ -918,20 +1131,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Hybrid shared secret established.");
     println!("You can now start messaging!");
 
-    let shared_hybrid_secret = Arc::new(hybrid_shared_secret.clone());
-    let shared_room_password = Arc::new(room_password.clone());
-    let shared_url = Arc::new(url.clone());
-
+    let shared_hybrid_secret = Arc::new(hybrid_shared_secret.clone());  // Keep as Arc<String>
+    let shared_room_id = Arc::new(Mutex::new(room_id.clone()));  // Wrap in Mutex
+    let shared_url = Arc::new(Mutex::new(url.clone()));  // Wrap in Mutex
+    
     let fetch_thread = {
         let shared_hybrid_secret = Arc::clone(&shared_hybrid_secret);
-        let shared_room_password = Arc::clone(&shared_room_password);
+        let shared_room_id = Arc::clone(&shared_room_id);
         let shared_url = Arc::clone(&shared_url);
-
+    
         thread::spawn(move || loop {
+            // Lock the Mutex to access the inner String
+            let room_id_locked = shared_room_id.lock().unwrap();
+            let url_locked = shared_url.lock().unwrap();
+    
+            // Pass the locked strings to the function
             match receive_and_fetch_messages(
-                &shared_room_password,
+                &room_id_locked,  // Pass the inner String
                 &shared_hybrid_secret,
-                &shared_url,
+                &url_locked,  // Pass the inner String
+                true,
             ) {
                 Ok(_) => {}
                 Err(e) => {
@@ -941,29 +1160,55 @@ fn main() -> Result<(), Box<dyn Error>> {
             thread::sleep(Duration::from_secs(10));
         })
     };
-
-    loop {
-        let mut message = String::new();
-        print!("Enter your message (or type 'exit' to quit): ");
-        io::stdout().flush()?;
-        io::stdin().read_line(&mut message)?;
-
-        let message = message.trim();
-
-        if message == "exit" {
-            println!("Exiting messaging session.");
-            break;
+    
+    if interface_choice.to_lowercase() == "gui" {
+        // Wrap only for passing to run_gui
+        let shared_hybrid_secret_for_gui = shared_hybrid_secret;
+        
+        let shared_room_id_for_gui: Arc<String> = {
+            let locked = shared_room_id.lock().unwrap();
+            Arc::new(locked.clone())
+        };
+        
+        let shared_url_for_gui: Arc<String> = {
+            let locked = shared_url.lock().unwrap();
+            Arc::new(locked.clone())
+        };
+        
+        // Pass the arguments
+        let _ = run_gui(
+            username.clone(),
+            shared_hybrid_secret_for_gui,
+            shared_room_id_for_gui,
+            shared_url_for_gui,
+        );
+        
+    } else {
+        loop {
+            let mut message = String::new();
+            print!("Enter your message (or type 'exit' to quit): ");
+            io::stdout().flush()?;
+            io::stdin().read_line(&mut message)?;
+    
+            let message = message.trim();
+    
+            if message == "exit" {
+                println!("Exiting messaging session.");
+                break;
+            }
+    
+            let message = format!("<strong>{}</strong>: {}", username, message);
+    
+            let encrypted_message = encrypt_data(&message, &hybrid_shared_secret)?;
+            send_encrypted_message(&encrypted_message, &room_id, &url)?;
         }
-
-        let message = format!("<strong>{}</strong>: {}", username, message);
-
-        let encrypted_message = encrypt_data(&message, &hybrid_shared_secret)?;
-        send_encrypted_message(&encrypted_message, &room_password, &url)?;
     }
-
+    
     if let Err(e) = fetch_thread.join() {
         eprintln!("Fetch thread terminated with error: {:?}", e);
     }
+    
+
 
     Ok(())
 }
@@ -988,7 +1233,7 @@ fn combine_shared_secrets(
 }
 
 fn perform_ecdh_key_exchange(
-    room_password: &str,
+    room_id: &str,
     eddsa_sk: &Ed25519SecretKey,
     eddsa_pk: &Ed25519PublicKey,
     server_url: &str, // Added parameter for server URL
@@ -1005,13 +1250,14 @@ fn perform_ecdh_key_exchange(
     // Format the signed public key with the proper markers
     let formatted_signed_public_key = format!("ECDH_PUBLIC_KEY:{}[END DATA]", signed_public_key);
 
-    let client = Client::new();
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
 
     loop {
         // Send the formatted signed public key to the server
         let message = Message {
             message: formatted_signed_public_key.clone(),
-            password: room_password.to_string(),
+            room_id: room_id.to_string(),
         };
 
         let send_url = format!("{}/send", server_url); // Use server_url for the send endpoint
@@ -1023,7 +1269,7 @@ fn perform_ecdh_key_exchange(
         }
 
         // Fetch the other party's signed public key
-        let fetch_url = format!("{}/messages?password={}", server_url, room_password); // Use server_url for the fetch endpoint
+        let fetch_url = format!("{}/messages?room_id={}", server_url, room_id); // Use server_url for the fetch endpoint
         let res = match client.get(&fetch_url).send() {
             Ok(response) => response,
             Err(err) => {
@@ -1095,7 +1341,7 @@ fn perform_ecdh_key_exchange(
                         return Ok(shared_secret_base64);
                     }
                     Err(err) => {
-                        eprintln!("Failed to decode other public key base64: {}", err);
+                        eprintln!("Failed to decode other public key: {}", err);
                     }
                 }
 
@@ -1116,11 +1362,12 @@ fn perform_ecdh_key_exchange(
 
 fn send_encrypted_message(
     encrypted_message: &str,
-    room_password: &str,
-    server_url: &str, // Added server URL parameter
-) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-    
+    room_id: &str,
+    server_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
+
     // Format the encrypted message with the BEGIN and END markers
     let formatted_encrypted_message = format!(
         "-----BEGIN ENCRYPTED MESSAGE-----{}-----END ENCRYPTED MESSAGE-----",
@@ -1130,7 +1377,7 @@ fn send_encrypted_message(
     // Create the message data to send
     let message_data = MessageData {
         message: formatted_encrypted_message,
-        password: room_password.to_string(),
+        room_id: room_id.to_string(),
     };
 
     // Construct the full URL for sending the message
@@ -1154,17 +1401,17 @@ fn send_encrypted_message(
 }
 
 fn receive_and_fetch_messages(
-    room_password: &str,
+    room_id: &str,
     shared_secret: &str,
-    server_url: &str, // Added server_url parameter
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::new();
+    server_url: &str,
+    gui: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // HTTP proxy setup
+    let proxy = "127.0.0.1:8118"; // HTTP Proxy address
+    let client = create_client_with_proxy(proxy);
 
     // Build the URL with the provided room password and server URL
-    let url = format!("{}/messages?password={}", server_url, room_password);
-
-    // Clear the screen before printing new messages
-    clear_screen();
+    let url = format!("{}/messages?room_id={}", server_url, room_id);
 
     // Send a synchronous GET request to fetch messages
     let res = client
@@ -1172,8 +1419,12 @@ fn receive_and_fetch_messages(
         .timeout(std::time::Duration::from_secs(5)) // Set a timeout for the request
         .send()?;
 
+    // Declare the vector to store messages outside the response block
+    let mut messages = Vec::new();
+
     // Check if the request was successful
     if res.status().is_success() {
+        clear_screen();
         // Get the body of the HTML response
         let body = res.text()?;
 
@@ -1190,19 +1441,28 @@ fn receive_and_fetch_messages(
                 // Step 2: Decrypt the message (ignore the markers, only pass the actual content)
                 match decrypt_data(cleaned_message, shared_secret) {
                     Ok(decrypted_message) => {
-                        // Step 3: Replace <strong> tags with ANSI escape codes for bold text
-                        let strong_re = Regex::new(r"<strong>(.*?)</strong>").unwrap();
-                        let final_message = strong_re.replace_all(&decrypted_message, |caps: &regex::Captures| {
-                            // Replace <strong>...</strong> with ANSI escape codes for bold text
-                            format!("\x1b[1m{}\x1b[0m", &caps[1])
-                        });
+                        // If gui is true, do not replace <strong> tags
+                        let final_message = if gui {
+                            decrypted_message.to_string()
+                        } else {
+                            // Step 3: Replace <strong> tags with ANSI escape codes for bold text
+                            let strong_re = Regex::new(r"<strong>(.*?)</strong>").unwrap();
+                            strong_re.replace_all(&decrypted_message, |caps: &regex::Captures| {
+                                // Replace <strong>...</strong> with ANSI escape codes for bold text
+                                format!("\x1b[1m{}\x1b[0m", &caps[1])
+                            }).to_string()
+                        };
 
-                        // Step 4: Print the decrypted message with the bold content
-                        println!("{}", final_message);
+                        // If gui is true, return the messages instead of printing them
+                        if gui {
+                            messages.push(final_message);
+                        } else {
+                            // Step 4: Print the decrypted message with the bold content
+                            println!("{}", final_message);
+                        }
                     }
-                    Err(e) => {
-                        // Provide a more specific error message here
-                        eprintln!("Failed to decrypt message: {}", e);
+                    Err(_e) => {
+                        // Handle decryption failure (if needed)
                     }
                 }
             }
@@ -1212,8 +1472,10 @@ fn receive_and_fetch_messages(
         eprintln!("Failed to fetch messages: {} - {}", res.status(), res.text()?);
     }
 
-    Ok(())
+    // Return the collected messages if gui is true, otherwise return empty messages
+    Ok(messages)
 }
+
 
 // Function to clear the screen before printing new messages
 fn clear_screen() {
@@ -1228,6 +1490,17 @@ fn clear_screen() {
         print!("\x1b[2J\x1b[H");
         std::io::stdout().flush().unwrap(); // Ensure the command is executed immediately
     }
+}
+
+// Derive a salt from the password itself
+fn derive_salt_from_password(password: &str) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    let hash_result = hasher.finalize();
+
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&hash_result[..16]); // Use the first 16 bytes of the hash as the salt
+    salt
 }
 
 // Derive encryption key using Argon2
